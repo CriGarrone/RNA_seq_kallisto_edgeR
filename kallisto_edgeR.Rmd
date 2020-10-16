@@ -1,0 +1,161 @@
+---
+title: "ReadMe Kallisto"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+##tximport to get count matrices / offsets 
+
+tximport, to import transcript lengths and abundance estimates from several popular quantification packages and export (estimated) count matrices and, optionally, average transcript length correction terms (i.e., offsets) that can be used as inputs to common statistical engines, such as DESeq211, edgeR12 and limma13.
+
+from paper: https://f1000research.com/articles/4-1521/v1
+Accounting for the potentially varying average transcript length across samples when performing DGE, either in the definition of the count matrix (scaledTPM) or by defining offsets, led to considerably improved false discovery rate (FDR) control compared to using the observed featureCounts or aggregated Salmon counts (simplesum) directly. 
+
+from tutorial:https://bioconductor.org/packages/release/bioc/vignettes/tximport/inst/doc/tximport.html
+1. Transcripts need to be associated with gene IDs for gene-level summarization.
+2. We first make a data.frame called tx2gene with two columns: 1) transcript ID and 2) gene ID. 
+3. The transcript ID must be the same one used in the abundance files.
+
+
+
+```{r}
+
+BiocManager::install("tximport")
+BiocManager::install("ensembldb")
+BiocManager::install("AnnotationHub")
+
+library(tximport)
+library(ensembldb)
+browseVignettes("ensembldb")
+library(AnnotationHub)
+library(AnnotationDbi)
+library(tidyverse)
+
+ah <- AnnotationHub()
+ahDb <- query(ah, pattern = c("Mus Musculus", "EnsDb", 87))
+ahDb
+ahEdb <- ahDb[[1]] #retrieve the MusMusculus Db
+
+ahEdb
+txdb <- transcripts(ahEdb, return.type = "data.frame")
+txdb
+
+
+tx2gene <- select(txdb, tx_name, gene_id) #check order of tx_name and gene_id
+head(tx2gene)
+
+?tximport
+files <- c("~/kallisto_anya_rnaseq/consolidated_tsv/mESC_1_bam.tsv","~/kallisto_anya_rnaseq/consolidated_tsv/mESC_2_bam.tsv", "~/kallisto_anya_rnaseq/consolidated_tsv/diff3_1_bam.tsv", "~/kallisto_anya_rnaseq/consolidated_tsv/diff3_2_bam.tsv", "~/kallisto_anya_rnaseq/consolidated_tsv/diff6_1_bam.tsv","~/kallisto_anya_rnaseq/consolidated_tsv/diff6_2_bam.tsv", "~/kallisto_anya_rnaseq/consolidated_tsv/diff12_1_bam.tsv", "~/kallisto_anya_rnaseq/consolidated_tsv/diff12_2_bam.tsv", "~/kallisto_anya_rnaseq/consolidated_tsv/diff24_1_bam.tsv", "~/kallisto_anya_rnaseq/consolidated_tsv/diff24_2_bam.tsv")
+
+txi.kallisto.tsv <- tximport(files ,type = "kallisto", tx2gene = tx2gene, ignoreAfterBar = TRUE, ignoreTxVersion = TRUE) #do i have to set the txOut = TRUE????
+head(txi.kallisto.tsv$counts)
+
+cts <- txi.kallisto.tsv$counts
+normMat <- txi.kallisto.tsv$length
+normMat <- normMat/exp(rowMeans(log(normMat)))
+
+
+library(edgeR)
+o <- log(calcNormFactors(cts/normMat)) + log(colSums(cts/normMat))
+y <- DGEList(cts)
+y$offset <- t(t(log(normMat)) + o)
+# y is now ready for estimate dispersion functions see edgeR User's Guide 
+
+```
+
+Not sure if the next bit is still applicable... probably disregard normalisation - do i still need to filter??? 
+
+
+## Cleanup files
+We will copy a renamed version of the  abundance.tsv files from each experiment to a parent directory.
+```{bash}
+cd ~/kallisto_anya_rnaseq
+mkdir consolidated_tsv
+for folder in *_bam;do
+  cp $folder/abundance.tsv consolidated_tsv/$folder.tsv
+done
+
+# mv is to move files, cp is to copy
+```
+
+## import countfiles into edgeR
+Several things to be done  
+1) Create a lists of files to be imported
+2) Import these files into R using edgeR::readDGE()
+```{r}
+# install edgeR if not yet installed
+if (!requireNamespace("BiocManager", quietly = TRUE)) 
+    install.packages("BiocManager")
+
+BiocManager::install("edgeR")
+library(edgeR)
+
+# create a list of files
+kallisto.files <- list.files("~/kallisto_anya_rnaseq/consolidated_tsv/", pattern = "*.tsv")
+kallisto.files
+kallisto.edgeR <- readDGE(kallisto.files, path = "~/kallisto_anya_rnaseq/consolidated_tsv/", columns=c(1,5))
+View(kallisto.edgeR$samples)
+View(kallisto.edgeR$counts)
+```
+
+
+##2.3 Filtering
+
+Link to tutorial = https://bioinformatics-core-shared-training.github.io/cruk-bioinf-sschool/Day3/rnaSeq_DE.pdf
+
+There are approximately 110000 genes in this dataset. However, many of them will not be expressed, or will not be represented by enough reads to contribute to the analysis. Removing these genes means that we have ultimately have fewer tests to perform, thereby reducing the problems associated with multiple testing. Here, we retain only those genes that are represented at least 1cpm reads in at least two samples (cpm=counts per million).
+
+```{r}
+View(kallisto.edgeR$counts)
+countsPerMillion <- cpm(kallisto.edgeR$counts)
+head(countsPerMillion)
+
+countCheck <- countsPerMillion > 1
+head(countCheck)
+
+?rowSums
+?which
+
+keep <- which(rowSums(countCheck) >= 2)
+dgList <- kallisto.edgeR[keep,]
+summary(cpm(dgList))
+View(dgList$counts)
+View(kallisto.edgeR$counts)
+
+```
+
+## Normalisation 
+
+Nice explanation of the CalcNormFactors function:
+https://www.youtube.com/watch?v=Wdt6jdi-NQo
+
+
+It is important to normalise RNA-seq both within and between samples. edgeR implements the trimmed mean of M-values (TMM) method.
+
+```{r}
+ ?calcNormFactors
+dgList <- calcNormFactors(dgList, method="TMM")
+dgList$samples
+
+```
+
+The effective library sizes for use in downstream analysis are lib.size * norm.factors where lib.size contains the original library sizes and norm.factors is the output from this function.
+```{r}
+eff.lib.size <- dgList$samples$lib.size*dgList$samples$norm.factors
+```
+
+
+From the normalization factors and the original count table, find the normalized counts and use the log2-transformation to inspect them with boxplots and a MDS (multidimentional scaling). Normalized counts can be extracted from dgeFull using the function cpm:
+
+
+```{r}
+NormalisedCounts <- cpm(dgList)
+NormalisedCounts
+pseudoNormalisedCounts <- log2(NormalisedCounts + 1)
+boxplot(pseudoNormalisedCounts, col="gray", las=3)
+plotMDS(pseudoNormalisedCounts)
+```
+
